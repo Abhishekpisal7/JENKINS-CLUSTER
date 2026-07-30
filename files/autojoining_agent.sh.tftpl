@@ -1,0 +1,106 @@
+#!/bin/bash
+set -uo pipefail
+
+# ---- Logging setup ----
+LOG_FILE="/var/log/jenkins-node-register.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+set -x
+
+echo "=== Script started at $(date -u) ==="
+
+# Configuration -- these ARE Terraform template variables, keep single $
+JENKINS_URL="${jenkins_url}"
+JENKINS_USERNAME="${jenkins_username}"
+JENKINS_PASSWORD="${jenkins_password}"
+JENKINS_CREDENTIALS_ID="${jenkins_credentials_id}"
+
+echo "JENKINS_URL=$JENKINS_URL"
+echo "JENKINS_USERNAME=$JENKINS_USERNAME"
+echo "JENKINS_CREDENTIALS_ID=$JENKINS_CREDENTIALS_ID"
+
+trap 'echo "=== Script exited at $(date -u) with code $? ==="; rm -f cookies.txt' EXIT
+
+# 1. Wait for Jenkins to become reachable
+MAX_RETRIES=60
+echo "Waiting for Jenkins to become reachable at $JENKINS_URL/login ..."
+for i in $(seq 1 "$MAX_RETRIES"); do
+    HTTP_STATUS=$(curl -s -o /dev/null -w "%%{http_code}" "$JENKINS_URL/login")
+    echo "Attempt $i/$MAX_RETRIES: HTTP status $HTTP_STATUS"
+    if [ "$HTTP_STATUS" = "200" ]; then
+        echo "Jenkins is up."
+        break
+    fi
+    if [ "$i" -eq "$MAX_RETRIES" ]; then
+        echo "ERROR: Jenkins did not become ready after $MAX_RETRIES attempts" >&2
+        exit 1
+    fi
+    sleep 10
+done
+
+# 2. Get crumb for CSRF protection
+echo "Requesting crumb from Jenkins..."
+CRUMB_RESPONSE=$(curl -s -u "$JENKINS_USERNAME:$JENKINS_PASSWORD" --cookie-jar cookies.txt \
+        "$JENKINS_URL/crumbIssuer/api/json")
+echo "Crumb raw response: $CRUMB_RESPONSE"
+
+CRUMB=$(echo "$CRUMB_RESPONSE" | jq -r '.crumb')
+echo "Parsed CRUMB=$CRUMB"
+
+if [ -z "$CRUMB" ] || [ "$CRUMB" = "null" ]; then
+    echo "ERROR: Failed to obtain Jenkins crumb" >&2
+    exit 1
+fi
+
+# 3. Get IMDSv2 token
+echo "Requesting IMDSv2 token..."
+TOKEN2=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+         -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+if [ -z "$TOKEN2" ]; then
+    echo "ERROR: Failed to obtain IMDSv2 token" >&2
+    exit 1
+fi
+echo "Got IMDSv2 token"
+
+# 4. Fetch instance details
+echo "Fetching instance metadata..."
+INSTANCE_NAME=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN2" \
+                http://169.254.169.254/latest/meta-data/local-hostname)
+INSTANCE_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN2" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+
+echo "INSTANCE_NAME=$INSTANCE_NAME"
+echo "INSTANCE_IP=$INSTANCE_IP"
+
+if [ -z "$INSTANCE_NAME" ] || [ -z "$INSTANCE_IP" ]; then
+    echo "ERROR: Failed to fetch instance metadata" >&2
+    exit 1
+fi
+
+# 5. Register the node with Jenkins via the script console
+echo "Registering node with Jenkins..."
+RESPONSE=$(curl -s -w "\n%%{http_code}" -X POST -u "$JENKINS_USERNAME:$JENKINS_PASSWORD" \
+     --cookie cookies.txt \
+     -H "Jenkins-Crumb: $CRUMB" \
+     --data-urlencode "script=
+import hudson.model.Node.Mode
+import hudson.slaves.*
+import jenkins.model.Jenkins
+import hudson.plugins.sshslaves.SSHLauncher
+
+DumbSlave dumb = new DumbSlave('$INSTANCE_NAME', '$INSTANCE_IP', '/home/ubuntu', '3', Mode.NORMAL, 'workers', new SSHLauncher('$INSTANCE_IP', 22, '$JENKINS_CREDENTIALS_ID'), RetentionStrategy.INSTANCE)
+Jenkins.get().addNode(dumb)
+" "$JENKINS_URL/script")
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+echo "Jenkins script console HTTP status: $HTTP_CODE"
+echo "Jenkins script console response body: $BODY"
+
+if [ "$HTTP_CODE" != "200" ]; then
+    echo "ERROR: Failed to register node with Jenkins (HTTP $HTTP_CODE)" >&2
+    exit 1
+fi
+
+echo "SUCCESS: Node '$INSTANCE_NAME' ($INSTANCE_IP) registered successfully."
